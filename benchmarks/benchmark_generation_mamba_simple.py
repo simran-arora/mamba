@@ -11,14 +11,15 @@ from einops import rearrange
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+import sys
+sys.path.append("/home/bfs/simran/clean4/ThunderKittens/demos/mamba2/mamba/")
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 
-
 parser = argparse.ArgumentParser(description="Generation benchmarking")
-parser.add_argument("--model-name", type=str, default="state-spaces/mamba-130m")
+parser.add_argument("--model-name", type=str, default="state-spaces/mamba2-370m")
 parser.add_argument("--prompt", type=str, default=None)
-parser.add_argument("--promptlen", type=int, default=100)
-parser.add_argument("--genlen", type=int, default=100)
+parser.add_argument("--promptlen", type=int, default=16384)
+parser.add_argument("--genlen", type=int, default=1)
 parser.add_argument("--temperature", type=float, default=1.0)
 parser.add_argument("--topk", type=int, default=1)
 parser.add_argument("--topp", type=float, default=1.0)
@@ -28,17 +29,19 @@ parser.add_argument("--batch", type=int, default=1)
 args = parser.parse_args()
 
 repeats = 3
+warmup = 2
 device = "cuda"
 dtype = torch.float16
+use_tk = True
 
 print(f"Loading model {args.model_name}")
 is_mamba = args.model_name.startswith("state-spaces/mamba") or args.model_name.startswith("state-spaces/transformerpp")
 if is_mamba:
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
-    model = MambaLMHeadModel.from_pretrained(args.model_name, device=device, dtype=dtype)
+    model = MambaLMHeadModel.from_pretrained(args.model_name, device=device, dtype=dtype, use_tk=use_tk)
 else:
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model = AutoModelForCausalLM.from_pretrained(args.model_name, device_map={"": device}, torch_dtype=dtype)
+    model = AutoModelForCausalLM.from_pretrained(args.model_name, device_map={"": device}, torch_dtype=dtype, use_tk=use_tk)
 model.eval()
 print(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
@@ -56,7 +59,7 @@ if is_mamba:
     fn = lambda: model.generate(
         input_ids=input_ids,
         max_length=max_length,
-        cg=True,
+        cg=False,
         return_dict_in_generate=True,
         output_scores=True,
         enable_timing=False,
@@ -83,10 +86,12 @@ out = fn()
 if args.prompt is not None:
     print(tokenizer.batch_decode(out.sequences.tolist()))
 
+for _ in range(warmup):
+    fn()
 torch.cuda.synchronize()
 start = time.time()
 for _ in range(repeats):
     fn()
 torch.cuda.synchronize()
-print(f"Prompt length: {len(input_ids[0])}, generation length: {len(out.sequences[0]) - len(input_ids[0])}")
+print(f"Use tk: {use_tk}, Prompt length: {len(input_ids[0])}, generation length: {len(out.sequences[0]) - len(input_ids[0])}")
 print(f"{args.model_name} prompt processing + decoding time: {(time.time() - start) / repeats * 1000:.0f}ms")

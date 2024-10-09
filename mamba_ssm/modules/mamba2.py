@@ -33,6 +33,13 @@ from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
 
 from huggingface_hub import PyTorchModelHubMixin
 
+try:
+    import thunderkittens as tk
+    print(f"Successfully imported thunderkittens")
+except ImportError:
+    tk = None
+    print(f'Failed to import thunderkittens; Please "pip setup.py install".')
+
 
 class Mamba2(nn.Module, PyTorchModelHubMixin):
     def __init__(
@@ -57,12 +64,13 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         conv_bias=True,
         # Fused kernel and sharding options
         chunk_size=256,
-        use_mem_eff_path=True,
+        use_mem_eff_path=False,
         layer_idx=None,  # Absorb kwarg for general module
         process_group=None,
         sequence_parallel=True,
         device=None,
         dtype=None,
+        use_tk=False,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -88,9 +96,17 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         self.norm_before_gate = norm_before_gate
         self.dt_limit = dt_limit
         self.activation = "silu"
-        self.chunk_size = chunk_size
+        self.chunk_size = 64 #chunk_size # SA Flag
         self.use_mem_eff_path = use_mem_eff_path
         self.layer_idx = layer_idx
+
+        if self.layer_idx == 0:
+            print(f"self.chunk_size: {self.chunk_size}")
+            print(f"self.d_state: {self.d_state}")
+
+        self.use_tk = use_tk
+        if self.layer_idx == 0:
+            print(f"self.use_tk: {self.use_tk}")
 
         # Order: [z, x, B, C, dt]
         d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
@@ -159,6 +175,8 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             (in case batch is small).
         Returns: same shape as u
         """
+        inference_params = None # SA Flag
+
         seqlen_og = seqlen
         if seqlen is None:
             batch, seqlen, dim = u.shape
@@ -181,6 +199,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         A = -torch.exp(self.A_log.float())  # (nheads) or (d_inner, d_state)
         dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
+        
         if self.use_mem_eff_path and inference_params is None:
             out = mamba_split_conv1d_scan_combined(
                 zxbcdt,
@@ -206,6 +225,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             if self.process_group is not None:
                 reduce_fn = reduce_scatter if self.sequence_parallel else all_reduce
                 out = reduce_fn(out, self.process_group)
+        
         else:
             d_mlp = (zxbcdt.shape[-1] - 2 * self.d_ssm - 2 * self.ngroups * self.d_state - self.nheads) // 2
             z0, x0, z, xBC, dt = torch.split(
@@ -241,23 +261,38 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                     seq_idx=seq_idx,
                 ).transpose(1, 2)
             x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
-            y = mamba_chunk_scan_combined(
-                rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
-                dt,
-                A,
-                rearrange(B, "b l (g n) -> b l g n", g=self.ngroups),
-                rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
-                chunk_size=self.chunk_size,
-                D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
-                z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim) if not self.rmsnorm else None,
-                dt_bias=self.dt_bias,
-                dt_softplus=True,
-                seq_idx=seq_idx,
-                cu_seqlens=cu_seqlens,
-                **dt_limit_kwargs,
-                return_final_states=ssm_state is not None,
-                return_varlen_states=cu_seqlens is not None and inference_params is not None,
-            )
+
+            if self.use_tk:
+                _dt = F.softplus(dt + self.dt_bias)
+                q = rearrange(C, "b l (h p) -> b h l p", p=self.headdim).to(torch.bfloat16).contiguous()
+                k = rearrange(B, "b l (h p) -> b h l p", p=self.headdim).to(torch.bfloat16).contiguous()
+                a = rearrange(A * _dt, "b h l -> b l h").to(torch.float32).contiguous()
+                v = rearrange(x, "b l (h p) -> b l h p", p=self.headdim) * _dt.unsqueeze(-1)
+                D_factor = v * rearrange(self.D, "d -> d 1")
+                v = rearrange(v, "b l h p -> b h l p", p=self.headdim).to(torch.bfloat16).contiguous()
+                y_tk = tk.mamba2(q, k, v, a) # chunk size is 64
+                y_tk = rearrange(y_tk, "b h l d -> b l h d").to(x.dtype).contiguous()
+                y = y_tk * D_factor.to(x.dtype)
+            else:
+                y = mamba_chunk_scan_combined(
+                    rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
+                    dt,
+                    A,
+                    rearrange(B, "b l (g n) -> b l g n", g=self.ngroups),
+                    rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
+                    chunk_size=self.chunk_size,
+                    D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
+                    z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim) if not self.rmsnorm else None,
+                    dt_bias=self.dt_bias,
+                    dt_softplus=True,
+                    seq_idx=seq_idx,
+                    cu_seqlens=cu_seqlens,
+                    **dt_limit_kwargs,
+                    return_final_states=ssm_state is not None,
+                    return_varlen_states=cu_seqlens is not None and inference_params is not None,
+                )
+
+
             if ssm_state is not None:
                 y, last_state, *rest = y
                 if cu_seqlens is None:
@@ -274,6 +309,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 y = rearrange(y, "b l d -> (b l) d")
             out = self.out_proj(y)
         return out
+
 
     def step(self, hidden_states, conv_state, ssm_state):
         dtype = hidden_states.dtype

@@ -39,6 +39,7 @@ def create_block(
     layer_idx=None,
     device=None,
     dtype=None,
+    use_tk=False,
 ):
     if ssm_cfg is None:
         ssm_cfg = {}
@@ -56,6 +57,7 @@ def create_block(
         mixer_cls = partial(
             Mamba2 if ssm_layer == "Mamba2" else Mamba,
             layer_idx=layer_idx,
+            use_tk=use_tk,
             **ssm_cfg,
             **factory_kwargs
         )
@@ -132,6 +134,7 @@ class MixerModel(nn.Module):
         residual_in_fp32=False,
         device=None,
         dtype=None,
+        use_tk=False,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -162,6 +165,7 @@ class MixerModel(nn.Module):
                     residual_in_fp32=residual_in_fp32,
                     fused_add_norm=fused_add_norm,
                     layer_idx=i,
+                    use_tk=use_tk,
                     **factory_kwargs,
                 )
                 for i in range(n_layer)
@@ -220,6 +224,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         initializer_cfg=None,
         device=None,
         dtype=None,
+        use_tk=False,
     ) -> None:
         self.config = config
         d_model = config.d_model
@@ -233,6 +238,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         residual_in_fp32 = config.residual_in_fp32
         fused_add_norm = config.fused_add_norm
         pad_vocab_size_multiple = config.pad_vocab_size_multiple
+        use_tk = use_tk
         factory_kwargs = {"device": device, "dtype": dtype}
 
         super().__init__()
@@ -250,6 +256,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
             initializer_cfg=initializer_cfg,
             fused_add_norm=fused_add_norm,
             residual_in_fp32=residual_in_fp32,
+            use_tk=use_tk,
             **factory_kwargs,
         )
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False, **factory_kwargs)

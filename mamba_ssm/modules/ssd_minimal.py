@@ -8,6 +8,8 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
+import sys
+sys.path.append("../../")
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
 
@@ -31,7 +33,7 @@ def segsum(x):
     x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
     return x_segsum
 
-def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None):
+def ssd_minimal_discrete(X, A, B, C, D=None, block_len=-1, initial_states=None):
     """
     Arguments:
         X: (batch, length, n_heads, d_head)
@@ -43,6 +45,9 @@ def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None):
     """
     assert X.dtype == A.dtype == B.dtype == C.dtype
     assert X.shape[1] % block_len == 0
+
+    if D is not None:
+        D_factor = D
 
     # Rearrange into blocks/chunks
     X, A, B, C = [rearrange(x, "b (c l) ... -> b c l ...", l=block_len) for x in (X, A, B, C)]
@@ -74,7 +79,9 @@ def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None):
     Y_off = torch.einsum('bclhn,bchpn,bhcl->bclhp', C, states, state_decay_out)
 
     # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
-    Y = rearrange(Y_diag+Y_off, "b c l h p -> b (c l) h p")
+    Y = rearrange(Y_diag+Y_off, "b c l h p -> b (c l) h p") 
+    if D is not None:
+        Y = Y + D_factor
     return Y, final_state
 
 
@@ -92,12 +99,49 @@ def test_correctness():
     device = "cuda"
 
     x = torch.randn(batch, seqlen, nheads, headdim, dtype=dtype, device=device)
-    dt = F.softplus(torch.randn(batch, seqlen, nheads, dtype=torch.float32, device=device) - 4).requires_grad_()
+    dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device=device).requires_grad_()
+    dt_bias = torch.randn(nheads, dtype=torch.float32, device=device).requires_grad_()
     A = (-torch.exp(torch.rand(nheads, dtype=torch.float32, device=device))).requires_grad_()
     B = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype, device=device)
     C = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype, device=device)
     D = torch.randn(nheads, dtype=dtype, device=device)
+    z = None
 
     # Comparing fused version and minimal version
-    y = mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=None)
-    y_min, _ = ssd_minimal_discrete(x*dt.unsqueeze(-1), A*dt, B, C, chunk_size)
+    y = mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=D, z=z, dt_bias=dt_bias, dt_softplus=True)
+
+    D_factor = x * rearrange(D, "d -> d 1")
+    _dt = F.softplus(dt + dt_bias)
+    y_min, _ = ssd_minimal_discrete(x*_dt.unsqueeze(-1), A*_dt, B, C, D=D_factor, block_len=chunk_size)
+
+    print(y[0,1000,4,:8])
+    print(y_min[0,1000,4,:8])
+
+    y_has_nan = torch.isnan(y).any()
+    y_min_has_nan = torch.isnan(y_min).any()
+    print(f"y has nan: {y_has_nan}; y_min has nan: {y_min_has_nan}")
+    diff = torch.max(torch.abs(y - y_min))
+    close = torch.allclose(y, y_min, atol=1e-4)
+    print(f"PyTorch-Triton: Max diff: {diff}; Close: {close}")
+
+if __name__ == "__main__":
+    test_correctness()
+
+
+# y = mamba_chunk_scan_combined(
+#                     rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
+#                     dt,
+#                     A,
+#                     rearrange(B, "b l (g n) -> b l g n", g=self.ngroups),
+#                     rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
+#                     chunk_size=self.chunk_size,
+#                     D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
+#                     z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim) if not self.rmsnorm else None,
+#                     dt_bias=self.dt_bias,
+#                     dt_softplus=True,
+#                     seq_idx=seq_idx,
+#                     cu_seqlens=cu_seqlens,
+#                     **dt_limit_kwargs,
+#                     return_final_states=ssm_state is not None,
+#                     return_varlen_states=cu_seqlens is not None and inference_params is not None,
+#                 )
